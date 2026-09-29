@@ -234,13 +234,11 @@ class GmailReadOnlyService:
 	def load_web_client_config(
 		credentials_file: Path = OAUTH_CLIENT_FILE,
 	) -> dict[str, Any]:
-		client_json = (
-			os.getenv("GMAIL_OAUTH_CLIENT_JSON")
-			or dotenv_values(ENV_FILE).get("GMAIL_OAUTH_CLIENT_JSON")
-			or ""
-		).strip()
+		client_json = os.getenv("GMAIL_OAUTH_CLIENT_JSON")
+		if client_json is None:
+			client_json = dotenv_values(ENV_FILE).get("GMAIL_OAUTH_CLIENT_JSON")
 		try:
-			if client_json:
+			if client_json is not None:
 				client_secrets = json.loads(client_json)
 			elif credentials_file.is_file():
 				client_secrets = json.loads(

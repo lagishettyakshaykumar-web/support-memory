@@ -32,7 +32,7 @@ environment variables in Render (or in an untracked local `.env` file):
 Use this Render start command:
 
 ```sh
-cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 ```
 
 Visit `/oauth2/start` to connect Gmail, then use `/gmail/messages` to read up to
