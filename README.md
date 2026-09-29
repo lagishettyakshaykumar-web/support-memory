@@ -14,31 +14,29 @@ requirements.txt
 README.md
 ```
 
-## Gmail read-only test
+## Gmail read-only web service
 
-1. In Google Cloud Console, enable the Gmail API and create an OAuth client ID
-	for a **Web application**. The existing Desktop client JSON is kept untouched
-	for reference; it cannot be used with the Codespaces HTTPS callback.
-	Configure the OAuth consent screen and add your Google account as a test user
-	if the app is in testing mode.
-2. Run `python backend/test_gmail.py` once to print the exact `OAuth callback:`
-	URI for this Codespace. Add that full URI as an **Authorized redirect URI**
-	for the Web application client. It has the form
-	`https://<CODESPACE_NAME>-8000.<GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN>/oauth2callback`.
-3. Download the Web application OAuth client JSON to
-	`backend/credentials/gmail-oauth-web-client.json`. The first authenticated
-	run saves the token as `backend/credentials/gmail-token.json`; both files and
-	the existing Desktop client are under the Git-ignored credentials directory.
-4. Ensure port `8000` is forwarded in the Codespaces **Ports** view. Keep it
-	private; the Python callback server binds to `0.0.0.0` and Google redirects to
-	the Codespaces HTTPS forwarded URL, never to localhost.
-5. Install dependencies with `pip install -r requirements.txt`, then rerun
-	`python backend/test_gmail.py` to complete browser authorization and read-only
-	Gmail access.
+Create a Google OAuth client ID for a **Web application**, enable the Gmail API,
+and configure the consent screen. Add your Google account as a test user if the
+consent screen is in testing mode. Configure the exact HTTPS
+`/oauth2callback` URL as an authorized redirect URI.
 
-The script requests only Gmail's `gmail.readonly` scope, reads at most one recent
-inbox message, and prints a draft response without sending or modifying email.
-On first run after configuring the Web client, open the OAuth URL printed in
-the terminal, complete consent, and let Google redirect the browser to the
-Codespaces HTTPS callback. The terminal waits for that callback and stores the
-resulting token locally.
+Install dependencies with `pip install -r requirements.txt`. Set these service
+environment variables in Render (or in an untracked local `.env` file):
+
+- `GMAIL_OAUTH_CLIENT_JSON`: the complete Web application OAuth client JSON.
+- `GMAIL_REDIRECT_URI`: the deployed HTTPS URL ending in `/oauth2callback`.
+- `GROQ_API_KEY` and optionally `GROQ_MODEL`.
+- `HINDSIGHT_API_KEY`, `HINDSIGHT_BANK_ID`, and optionally `HINDSIGHT_BASE_URL`.
+
+Use this Render start command:
+
+```sh
+cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+Visit `/oauth2/start` to connect Gmail, then use `/gmail/messages` to read up to
+10 recent inbox messages. The service requests only the
+`https://www.googleapis.com/auth/gmail.readonly` scope and keeps OAuth state and
+credentials in memory for the lifetime of the running process. No email is
+modified or sent. Do not commit `.env`, OAuth client JSON, or token files.

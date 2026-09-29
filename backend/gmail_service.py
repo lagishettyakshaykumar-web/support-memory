@@ -5,22 +5,19 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import time
+import os
 from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.utils import parseaddr
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
-from threading import Event
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -30,9 +27,7 @@ CREDENTIALS_DIR = Path(__file__).resolve().parent / "credentials"
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 OAUTH_CLIENT_FILE = CREDENTIALS_DIR / "gmail-oauth-web-client.json"
 TOKEN_FILE = CREDENTIALS_DIR / "gmail-token.json"
-OAUTH_CALLBACK_PORT = 8000
 OAUTH_CALLBACK_PATH = "/oauth2callback"
-OAUTH_CALLBACK_TIMEOUT_SECONDS = 600
 
 
 class GmailServiceError(RuntimeError):
@@ -190,6 +185,7 @@ class GmailReadOnlyService:
 		credentials_file: Path = OAUTH_CLIENT_FILE,
 		token_file: Path = TOKEN_FILE,
 		gmail_client: Any | None = None,
+		credentials: Credentials | None = None,
 	) -> None:
 		self.credentials_file = Path(credentials_file)
 		self.token_file = Path(token_file)
@@ -197,7 +193,16 @@ class GmailReadOnlyService:
 			self._service = gmail_client
 			return
 
-		credentials = self._authorize()
+		credentials = credentials or self._load_local_credentials()
+		if credentials and credentials.expired and credentials.refresh_token:
+			try:
+				credentials.refresh(Request())
+			except GoogleAuthError:
+				credentials = None
+		if credentials is None or not credentials.valid:
+			raise GmailOAuthError(
+				"Gmail is not authorized. Visit /oauth2/start to connect a Gmail account."
+			)
 		try:
 			self._service = build(
 				"gmail", "v1", credentials=credentials, cache_discovery=False
@@ -205,9 +210,7 @@ class GmailReadOnlyService:
 		except Exception as exc:
 			raise GmailAPIError("Could not initialize the Gmail API client") from exc
 
-	def _authorize(self) -> Credentials:
-		redirect_uri = self.gmail_redirect_uri()
-		client_config = self._load_web_client_config()
+	def _load_local_credentials(self) -> Credentials | None:
 		credentials = None
 		if self.token_file.exists():
 			try:
@@ -215,8 +218,6 @@ class GmailReadOnlyService:
 					str(self.token_file), [GMAIL_READONLY_SCOPE]
 				)
 			except (OSError, ValueError, GoogleAuthError):
-				credentials = None
-			if credentials and credentials.client_id != client_config["client_id"]:
 				credentials = None
 
 		if credentials and credentials.expired and credentials.refresh_token:
@@ -227,57 +228,45 @@ class GmailReadOnlyService:
 
 		if credentials and credentials.valid:
 			return credentials
+		return None
 
+	@staticmethod
+	def load_web_client_config(
+		credentials_file: Path = OAUTH_CLIENT_FILE,
+	) -> dict[str, Any]:
+		client_json = (
+			os.getenv("GMAIL_OAUTH_CLIENT_JSON")
+			or dotenv_values(ENV_FILE).get("GMAIL_OAUTH_CLIENT_JSON")
+			or ""
+		).strip()
 		try:
-			flow = Flow.from_client_secrets_file(
-				str(self.credentials_file), scopes=[GMAIL_READONLY_SCOPE]
-			)
-			flow.redirect_uri = redirect_uri
-			authorization_url, _ = flow.authorization_url(
-				access_type="offline", prompt="consent"
-			)
-		except Exception as exc:
-			raise GmailOAuthError("Could not prepare the Gmail OAuth authorization") from exc
-
-		result: dict[str, Any] = {"done": Event(), "credentials": None, "error": None}
-		self._run_codespaces_callback(flow, redirect_uri, result, authorization_url)
-		if result["error"]:
-			raise GmailOAuthError(str(result["error"]))
-		credentials = result["credentials"]
-		if not isinstance(credentials, Credentials):
-			raise GmailOAuthError("Gmail OAuth callback returned no credentials")
-
-		try:
-			self.token_file.parent.mkdir(parents=True, exist_ok=True)
-			self.token_file.write_text(credentials.to_json(), encoding="utf-8")
-		except OSError as exc:
-			raise GmailOAuthError("Could not save the local Gmail OAuth token") from exc
-		return credentials
-
-	def _load_web_client_config(self) -> dict[str, Any]:
-		if not self.credentials_file.is_file():
-			raise GmailCredentialsMissingError(
-				"Gmail OAuth Web application client file is missing. Place the downloaded "
-			f"Web client JSON at: {self.credentials_file}"
-			)
-		try:
-			client_secrets = json.loads(self.credentials_file.read_text(encoding="utf-8"))
+			if client_json:
+				client_secrets = json.loads(client_json)
+			elif credentials_file.is_file():
+				client_secrets = json.loads(
+					credentials_file.read_text(encoding="utf-8")
+				)
+			else:
+				raise GmailCredentialsMissingError(
+					"Gmail OAuth Web client JSON is missing. Set GMAIL_OAUTH_CLIENT_JSON "
+					"or provide the local Web client JSON file."
+				)
 		except (OSError, json.JSONDecodeError) as exc:
 			raise GmailOAuthError("Could not read the Gmail OAuth client JSON") from exc
 		web_config = client_secrets.get("web") if isinstance(client_secrets, dict) else None
 		if not isinstance(web_config, dict) or not web_config.get("client_id"):
 			raise GmailOAuthError(
-				"Codespaces requires a Google Web application OAuth client. Place its "
-			f"JSON at {self.credentials_file}; the Desktop client file can remain "
-			"untouched for reference."
+				"Gmail OAuth requires a Google Web application client configuration."
 			)
-		return web_config
+		return {"web": web_config}
 
 	@staticmethod
 	def gmail_redirect_uri() -> str:
-		redirect_uri = dotenv_values(ENV_FILE).get("GMAIL_REDIRECT_URI")
+		redirect_uri = os.getenv("GMAIL_REDIRECT_URI") or dotenv_values(ENV_FILE).get(
+			"GMAIL_REDIRECT_URI"
+		)
 		if not redirect_uri:
-			raise GmailOAuthError(f"GMAIL_REDIRECT_URI is missing from {ENV_FILE}")
+			raise GmailOAuthError("GMAIL_REDIRECT_URI is not configured")
 
 		parsed_uri = urlsplit(redirect_uri)
 		if (
@@ -292,104 +281,6 @@ class GmailReadOnlyService:
 				f"{OAUTH_CALLBACK_PATH}"
 			)
 		return redirect_uri
-
-	def _run_codespaces_callback(
-		self,
-		flow: Flow,
-		redirect_uri: str,
-		result: dict[str, Any],
-		authorization_url: str,
-	) -> None:
-		completion_event: Event = result["done"]
-
-		class OAuthCallbackHandler(BaseHTTPRequestHandler):
-			def do_GET(self) -> None:
-				request_uri = urlsplit(self.path)
-				if request_uri.path != OAUTH_CALLBACK_PATH:
-					self.send_error(404)
-					return
-
-				query_params = parse_qs(request_uri.query, keep_blank_values=True)
-				code_values = query_params.get("code", [])
-				state_values = query_params.get("state", [])
-				if not code_values or len(code_values) != 1:
-					status = 400
-					body = "Gmail authorization failed: missing OAuth code."
-					result["error"] = "Missing OAuth code in the callback request."
-					self._finish_callback(status, body)
-					completion_event.set()
-					return
-
-				if not state_values or len(state_values) != 1:
-					status = 400
-					body = "Gmail authorization failed: missing OAuth state."
-					result["error"] = "Missing OAuth state in the callback request."
-					self._finish_callback(status, body)
-					completion_event.set()
-					return
-
-				code = code_values[0]
-				state = state_values[0]
-				expected_state = getattr(flow, "state", None) or getattr(flow, "_state", None)
-				if expected_state is None or state != expected_state:
-					status = 400
-					body = "Gmail authorization failed: invalid OAuth state."
-					result["error"] = "OAuth state mismatch during callback verification."
-					self._finish_callback(status, body)
-					completion_event.set()
-					return
-
-				try:
-					flow.fetch_token(code=code, state=state)
-					credentials = flow.credentials
-					result["credentials"] = credentials
-					status = 200
-					body = (
-						"Gmail authorization succeeded. You can close this browser tab "
-						"and return to the Codespace terminal."
-					)
-				except Exception:
-					status = 400
-					result["error"] = (
-						"Gmail OAuth callback verification failed. Check the authorized "
-						"redirect URI and retry authorization."
-					)
-					body = "Gmail authorization failed. Return to the Codespace terminal."
-				self._finish_callback(status, body)
-				completion_event.set()
-
-			def _finish_callback(self, status: int, body: str) -> None:
-				self.send_response(status)
-				self.send_header("Content-Type", "text/plain; charset=utf-8")
-				self.end_headers()
-				self.wfile.write(body.encode("utf-8"))
-
-			def log_message(self, _format: str, *_args: Any) -> None:
-				return
-
-		try:
-			server = HTTPServer(("0.0.0.0", OAUTH_CALLBACK_PORT), OAuthCallbackHandler)
-		except OSError as exc:
-			raise GmailOAuthError(
-				f"Could not bind the OAuth callback port {OAUTH_CALLBACK_PORT}; "
-				"check whether another process is using it."
-			) from exc
-
-		print("Open this URL in your browser to authorize read-only Gmail access:")
-		print(authorization_url)
-		print(f"Waiting for OAuth callback at {redirect_uri}")
-		server.timeout = 1
-		deadline = time.monotonic() + OAUTH_CALLBACK_TIMEOUT_SECONDS
-		try:
-			while not completion_event.is_set() and time.monotonic() < deadline:
-				server.handle_request()
-		finally:
-			server.server_close()
-		if not completion_event.is_set():
-			raise GmailOAuthError(
-				"Timed out waiting for the Codespaces OAuth callback. Check that port "
-				f"{OAUTH_CALLBACK_PORT} is forwarded and retry."
-			)
 
 	def list_recent_inbox_messages(self, max_results: int = 5) -> list[GmailMessage]:
 		"""Fetch at most max_results recent inbox messages, without modifying them."""
